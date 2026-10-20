@@ -239,7 +239,7 @@ if(UNIX)
     endif()
 elseif(WIN32)
     # OpenGL, just raw OpenGL goodness
-    target_link_libraries(Hyperspace PRIVATE OpenGL::GL)
+    target_link_libraries(Hyperspace PRIVATE OpenGL::GL ws2_32) # ws2_32: features/netplay
 
     target_compile_definitions(Hyperspace PRIVATE BUILD_DLL)
 endif()
