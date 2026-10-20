@@ -1,5 +1,7 @@
 #include "Netplay.h"
 #include "Global.h"
+#include <csignal>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -45,6 +47,38 @@ namespace
 
     const int DELTA_MS = 100;
 
+    // Own log per mode: FTL_HS.log is shared (and truncated) when two instances run from one folder
+    FILE* logFile = nullptr;
+    void Log(const char* fmt, ...)
+    {
+        if (!logFile) return;
+        va_list va;
+        va_start(va, fmt);
+        vfprintf(logFile, fmt, va);
+        va_end(va);
+        fflush(logFile);
+    }
+
+    void LogAddress(const char* label, DWORD addr)
+    {
+        HMODULE m;
+        char name[MAX_PATH] = "?";
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &m)) return;
+        GetModuleFileNameA(m, name, MAX_PATH);
+        const char* base = strrchr(name, '\\');
+        Log("%s %s+0x%lx\n", label, base ? base + 1 : name, addr - (DWORD)m);
+    }
+
+    // Diagnostics: logs the faulting address and code-looking stack values as module+offset
+    LONG WINAPI OnCrash(EXCEPTION_POINTERS* ep)
+    {
+        Log("CRASH code 0x%08lx\n", ep->ExceptionRecord->ExceptionCode);
+        LogAddress("  at", (DWORD)ep->ExceptionRecord->ExceptionAddress);
+        DWORD* sp = (DWORD*)ep->ContextRecord->Esp;
+        for (int i = 0; i < 512; i++) LogAddress("  stack", sp[i]);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     void ReadConfig()
     {
         configRead = true;
@@ -59,9 +93,12 @@ namespace
         if (word == "host") { mode = HOST; f >> port; }
         else if (word == "join") { mode = JOIN; f >> joinAddr >> port; }
         if (mode == OFF) return;
+        logFile = fopen(mode == HOST ? "netplay_host.log" : "netplay_join.log", "w");
+        SetUnhandledExceptionFilter(OnCrash);
+        signal(SIGABRT, [](int) { Log("abort() called (failed assert?)\n"); });
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
-        hs_log_file("Netplay: %s %s:%d\n", mode == HOST ? "hosting on" : "joining", joinAddr.c_str(), port);
+        Log("%s %s:%d\n", mode == HOST ? "hosting on" : "joining", joinAddr.c_str(), port);
     }
 
     void SetNonBlocking(SOCKET s)
@@ -77,7 +114,7 @@ namespace
         inbox.clear();
         outbox.clear();
         wantFull = true;
-        hs_log_file("Netplay: disconnected\n");
+        Log("disconnected\n");
     }
 
     void Send(Netplay::MsgType type, const std::vector<uint8_t>& payload)
@@ -123,21 +160,31 @@ namespace
     // Returns false when the ship layout no longer matches and a FULL resync is needed.
     bool ImportDelta(ShipManager* sm, CommandGui* gui, const std::vector<uint8_t>& bytes)
     {
+        static int applied = 0;
+        bool trace = applied++ < 2; // step markers for the first deltas only
+        auto step = [&](const char* s) { if (trace) Log("delta: %s\n", s); };
         WriteFile(TempPath(), bytes);
         int fd = FileHelper::readBinaryFile(TempPath());
         bool ok = true;
+        step("pause/hull");
         gui->SetPaused(FileHelper::readInteger(fd), false);
         sm->ship.hullIntegrity.first = FileHelper::readInteger(fd);
+        step("systems");
         if ((size_t)FileHelper::readInteger(fd) != sm->vSystemList.size()) ok = false;
         if (ok) for (auto sys : sm->vSystemList) sys->LoadState(fd);
+        step("crew");
         if (ok && (size_t)FileHelper::readInteger(fd) != sm->vCrewList.size()) ok = false;
         if (ok) for (auto crew : sm->vCrewList) crew->LoadState(fd);
+        step("doors");
         if (ok && (size_t)FileHelper::readInteger(fd) != sm->ship.vDoorList.size()) ok = false;
         if (ok) for (auto door : sm->ship.vDoorList) door->LoadState(fd);
+        step("shields");
         if (ok && FileHelper::readInteger(fd) != (sm->shieldSystem != nullptr)) ok = false;
         if (ok && sm->shieldSystem) sm->shieldSystem->Load(fd);
+        step("battle state");
         if (ok) sm->ImportBattleState(fd);
         FileHelper::closeBinaryFile(fd);
+        step(ok ? "done" : "layout mismatch, resync");
         return ok;
     }
 
@@ -157,11 +204,13 @@ namespace
         case Netplay::FULL:
             if (mode == JOIN)
             {
+                Log("loading %u bytes of state\n", (unsigned)payload.size());
                 WriteFile(TempPath(), payload);
                 world->LoadGame(TempPath());
+                Log("LoadGame returned\n");
                 G_->GetCApp()->menu.Close();
                 wantFull = false;
-                hs_log_file("Netplay: joined, %u bytes of state\n", (unsigned)payload.size());
+                Log("joined, %u bytes of state\n", (unsigned)payload.size());
             }
             break;
         case Netplay::DELTA:
@@ -203,7 +252,7 @@ namespace
                 addr.sin_port = htons(port);
                 if (bind(listener, (sockaddr*)&addr, sizeof addr) != 0 || listen(listener, 1) != 0)
                 {
-                    hs_log_file("Netplay: listen failed %d\n", WSAGetLastError());
+                    Log("listen failed %d\n", WSAGetLastError());
                     closesocket(listener);
                     listener = INVALID_SOCKET;
                     mode = OFF;
@@ -212,7 +261,7 @@ namespace
                 SetNonBlocking(listener);
             }
             peer = accept(listener, nullptr, nullptr);
-            if (peer != INVALID_SOCKET) { SetNonBlocking(peer); hs_log_file("Netplay: client connected\n"); }
+            if (peer != INVALID_SOCKET) { SetNonBlocking(peer); Log("client connected\n"); }
         }
         else if (now - lastConnect > 2000)
         {
@@ -222,7 +271,7 @@ namespace
             addr.sin_port = htons(port);
             inet_pton(AF_INET, joinAddr.c_str(), &addr.sin_addr);
             SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-            if (connect(s, (sockaddr*)&addr, sizeof addr) == 0) { peer = s; SetNonBlocking(s); hs_log_file("Netplay: connected to host\n"); }
+            if (connect(s, (sockaddr*)&addr, sizeof addr) == 0) { peer = s; SetNonBlocking(s); Log("connected to host\n"); }
             else closesocket(s);
         }
     }
