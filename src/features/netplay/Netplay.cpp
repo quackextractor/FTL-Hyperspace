@@ -175,6 +175,13 @@ namespace
         step("crew");
         if (ok && (size_t)FileHelper::readInteger(fd) != sm->vCrewList.size()) ok = false;
         if (ok) for (auto crew : sm->vCrewList) crew->LoadState(fd);
+        // Hyperspace's CrewMember::LoadState recreates crew powers; crew boxes hold pointers to the old ones.
+        // shortcut: rebuilds the crew UI every delta, switch to a diff-based crew sync if it flickers.
+        if (ok)
+        {
+            gui->crewControl.ClearCrewBoxes();
+            gui->crewControl.UpdateCrewBoxes();
+        }
         step("doors");
         if (ok && (size_t)FileHelper::readInteger(fd) != sm->ship.vDoorList.size()) ok = false;
         if (ok) for (auto door : sm->ship.vDoorList) door->LoadState(fd);
