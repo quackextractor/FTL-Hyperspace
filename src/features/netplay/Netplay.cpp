@@ -1,5 +1,6 @@
 #include "Netplay.h"
 #include "Global.h"
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -47,7 +48,12 @@ namespace
     void ReadConfig()
     {
         configRead = true;
-        std::ifstream f("netplay.txt");
+        // NETPLAY env var overrides the file, so two instances can run from one folder
+        const char* env = getenv("NETPLAY");
+        std::istringstream envCfg(env ? env : "");
+        std::ifstream file;
+        if (!env) file.open("netplay.txt");
+        std::istream& f = env ? (std::istream&)envCfg : file;
         std::string word;
         if (!(f >> word)) return;
         if (word == "host") { mode = HOST; f >> port; }
@@ -91,7 +97,8 @@ namespace
         f.write((const char*)bytes.data(), bytes.size());
     }
 
-    std::string TempPath() { return FileHelper::getUserFolder() + "netplay.tmp"; }
+    // Per-mode name: host and client may share a user folder when testing on one PC
+    std::string TempPath() { return FileHelper::getUserFolder() + (mode == HOST ? "netplay_host.tmp" : "netplay_join.tmp"); }
 
     // shortcut: state goes through a temp file because FileHelper's in-memory fd needs the
     // saveFileData global's address; switch to a ZHL variable sig once deltas get bigger.
