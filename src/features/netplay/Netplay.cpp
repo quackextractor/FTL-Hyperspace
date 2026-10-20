@@ -44,8 +44,9 @@ namespace
     std::vector<uint8_t> inbox, outbox;
     uint64_t lastHello = 0, lastDelta = 0, lastConnect = 0;
     bool wantFull = true; // client: still need a FULL from the host
+    bool joined = false;  // client: loaded a host save, so the local sim stays off
 
-    const int DELTA_MS = 100;
+    const int DELTA_MS = 50;
 
     // Own log per mode: FTL_HS.log is shared (and truncated) when two instances run from one folder
     FILE* logFile = nullptr;
@@ -139,59 +140,93 @@ namespace
 
     // shortcut: state goes through a temp file because FileHelper's in-memory fd needs the
     // saveFileData global's address; switch to a ZHL variable sig once deltas get bigger.
-    std::vector<uint8_t> ExportDelta(ShipManager* sm, bool paused)
+    // Identifies "where" the game is; the client reloads the full save when the host's differs.
+    // Client never simulates (see WorldManager::OnLoop hook), so its key only changes on load.
+    std::string LocationKey(WorldManager* world)
     {
-        int fd = FileHelper::createBinaryFile(TempPath());
-        FileHelper::writeInt(fd, paused);
+        std::ostringstream k;
+        k << world->starMap.worldLevel;
+        if (world->starMap.currentLoc) k << ' ' << world->starMap.currentLoc->loc.x << ' ' << world->starMap.currentLoc->loc.y;
+        CompleteShip* enemy = world->playerShip->enemyShip;
+        k << ' ' << (enemy ? enemy->shipManager->myBlueprint.blueprintName : std::string("-"));
+        return k.str();
+    }
+
+    void ExportShip(int fd, ShipManager* sm)
+    {
         FileHelper::writeInt(fd, sm->ship.hullIntegrity.first);
         FileHelper::writeInt(fd, sm->vSystemList.size());
         for (auto sys : sm->vSystemList) sys->SaveState(fd);
         FileHelper::writeInt(fd, sm->vCrewList.size());
-        for (auto crew : sm->vCrewList) crew->SaveState(fd);
+        for (auto crew : sm->vCrewList)
+        {
+            crew->SaveState(fd);
+            // SaveState has no position; a save gets it from ExportShip
+            FileHelper::writeFloat(fd, crew->x);
+            FileHelper::writeFloat(fd, crew->y);
+            FileHelper::writeInt(fd, crew->iRoomId);
+        }
         FileHelper::writeInt(fd, sm->ship.vDoorList.size());
         for (auto door : sm->ship.vDoorList) door->SaveState(fd);
         FileHelper::writeInt(fd, sm->shieldSystem != nullptr);
         if (sm->shieldSystem) sm->shieldSystem->Save(fd);
         sm->ExportBattleState(fd);
+    }
+
+    // Returns false when the ship layout no longer matches and a FULL resync is needed.
+    bool ImportShip(int fd, ShipManager* sm)
+    {
+        sm->ship.hullIntegrity.first = FileHelper::readInteger(fd);
+        if ((size_t)FileHelper::readInteger(fd) != sm->vSystemList.size()) return false;
+        for (auto sys : sm->vSystemList) sys->LoadState(fd);
+        if ((size_t)FileHelper::readInteger(fd) != sm->vCrewList.size()) return false;
+        for (auto crew : sm->vCrewList)
+        {
+            crew->LoadState(fd);
+            crew->x = FileHelper::readFloat(fd);
+            crew->y = FileHelper::readFloat(fd);
+            crew->iRoomId = FileHelper::readInteger(fd);
+        }
+        if ((size_t)FileHelper::readInteger(fd) != sm->ship.vDoorList.size()) return false;
+        for (auto door : sm->ship.vDoorList) door->LoadState(fd);
+        if (FileHelper::readInteger(fd) != (sm->shieldSystem != nullptr)) return false;
+        if (sm->shieldSystem) sm->shieldSystem->Load(fd);
+        sm->ImportBattleState(fd);
+        return true;
+    }
+
+    std::vector<uint8_t> ExportDelta(WorldManager* world, bool paused)
+    {
+        int fd = FileHelper::createBinaryFile(TempPath());
+        FileHelper::writeString(fd, LocationKey(world));
+        FileHelper::writeInt(fd, paused);
+        ExportShip(fd, world->playerShip->shipManager);
+        CompleteShip* enemy = world->playerShip->enemyShip;
+        FileHelper::writeInt(fd, enemy != nullptr);
+        if (enemy) ExportShip(fd, enemy->shipManager);
         FileHelper::closeBinaryFile(fd);
         return ReadFile(TempPath());
     }
 
-    // Returns false when the ship layout no longer matches and a FULL resync is needed.
-    bool ImportDelta(ShipManager* sm, CommandGui* gui, const std::vector<uint8_t>& bytes)
+    // Returns false when a FULL resync is needed (host moved on, or layouts differ).
+    bool ImportDelta(WorldManager* world, CommandGui* gui, const std::vector<uint8_t>& bytes)
     {
-        static int applied = 0;
-        bool trace = applied++ < 2; // step markers for the first deltas only
-        auto step = [&](const char* s) { if (trace) Log("delta: %s\n", s); };
         WriteFile(TempPath(), bytes);
         int fd = FileHelper::readBinaryFile(TempPath());
         bool ok = true;
-        step("pause/hull");
-        gui->SetPaused(FileHelper::readInteger(fd), false);
-        sm->ship.hullIntegrity.first = FileHelper::readInteger(fd);
-        step("systems");
-        if ((size_t)FileHelper::readInteger(fd) != sm->vSystemList.size()) ok = false;
-        if (ok) for (auto sys : sm->vSystemList) sys->LoadState(fd);
-        step("crew");
-        if (ok && (size_t)FileHelper::readInteger(fd) != sm->vCrewList.size()) ok = false;
-        if (ok) for (auto crew : sm->vCrewList) crew->LoadState(fd);
+        std::string hostKey = FileHelper::readString(fd);
+        std::string myKey = LocationKey(world);
+        if (hostKey != myKey) { Log("host moved: '%s' (mine '%s'), resyncing\n", hostKey.c_str(), myKey.c_str()); ok = false; }
+        if (ok) gui->SetPaused(FileHelper::readInteger(fd), false);
+        if (ok && !ImportShip(fd, world->playerShip->shipManager)) { Log("player ship layout changed, resyncing\n"); ok = false; }
         // Hyperspace's CrewMember::LoadState recreates crew powers; crew boxes hold pointers to the old ones.
         // shortcut: rebuilds the crew UI every delta, switch to a diff-based crew sync if it flickers.
-        if (ok)
-        {
-            gui->crewControl.ClearCrewBoxes();
-            gui->crewControl.UpdateCrewBoxes();
-        }
-        step("doors");
-        if (ok && (size_t)FileHelper::readInteger(fd) != sm->ship.vDoorList.size()) ok = false;
-        if (ok) for (auto door : sm->ship.vDoorList) door->LoadState(fd);
-        step("shields");
-        if (ok && FileHelper::readInteger(fd) != (sm->shieldSystem != nullptr)) ok = false;
-        if (ok && sm->shieldSystem) sm->shieldSystem->Load(fd);
-        step("battle state");
-        if (ok) sm->ImportBattleState(fd);
+        gui->crewControl.ClearCrewBoxes();
+        gui->crewControl.UpdateCrewBoxes();
+        CompleteShip* enemy = world->playerShip->enemyShip;
+        if (ok && FileHelper::readInteger(fd) != (enemy != nullptr)) ok = false;
+        if (ok && enemy && !ImportShip(fd, enemy->shipManager)) { Log("enemy ship layout changed, resyncing\n"); ok = false; }
         FileHelper::closeBinaryFile(fd);
-        step(ok ? "done" : "layout mismatch, resync");
         return ok;
     }
 
@@ -211,19 +246,19 @@ namespace
         case Netplay::FULL:
             if (mode == JOIN)
             {
-                Log("loading %u bytes of state\n", (unsigned)payload.size());
+                // shortcut: LoadGame leaks the previous ship on every resync (each jump), fine for a session
                 WriteFile(TempPath(), payload);
                 world->LoadGame(TempPath());
-                Log("LoadGame returned\n");
                 G_->GetCApp()->menu.Close();
                 wantFull = false;
-                Log("joined, %u bytes of state\n", (unsigned)payload.size());
+                joined = true;
+                Log("loaded %u bytes of state at '%s'\n", (unsigned)payload.size(), LocationKey(world).c_str());
             }
             break;
         case Netplay::DELTA:
             if (mode == JOIN && !wantFull && world->bStartedGame)
             {
-                if (!ImportDelta(world->playerShip->shipManager, gui, payload)) wantFull = true;
+                if (!ImportDelta(world, gui, payload)) wantFull = true;
             }
             break;
         }
@@ -292,11 +327,12 @@ void Netplay::Poll()
     if (peer == INVALID_SOCKET) { Connect(now); return; }
 
     WorldManager* world = G_->GetWorld();
-    if (mode == JOIN && wantFull && now - lastHello > 2000) { lastHello = now; Send(HELLO, {}); }
+    // Host ignores HELLO while it can't save (events, jump animation), so keep asking
+    if (mode == JOIN && wantFull && now - lastHello > 500) { lastHello = now; Send(HELLO, {}); }
     if (mode == HOST && world->bStartedGame && now - lastDelta > DELTA_MS)
     {
         lastDelta = now;
-        Send(DELTA, ExportDelta(world->playerShip->shipManager, G_->GetCApp()->gui->IsPaused()));
+        Send(DELTA, ExportDelta(world, G_->GetCApp()->gui->IsPaused()));
     }
     PumpSocket();
 }
@@ -306,6 +342,15 @@ HOOK_METHOD(CApp, OnLoop, () -> void)
     LOG_HOOK("HOOK_METHOD -> CApp::OnLoop -> Begin (Netplay.cpp)\n")
     super();
     Netplay::Poll();
+}
+
+// Puppet client: the host's state is the only truth, so the client world never advances on its own.
+// Lowest priority installs last, so this runs before every other WorldManager::OnLoop hook.
+HOOK_METHOD_PRIORITY(WorldManager, OnLoop, -10000, () -> void)
+{
+    LOG_HOOK("HOOK_METHOD_PRIORITY -> WorldManager::OnLoop -> Begin (Netplay.cpp)\n")
+    if (mode == JOIN && joined) return;
+    super();
 }
 #else
 void Netplay::Poll() {}
